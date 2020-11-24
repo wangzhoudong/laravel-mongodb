@@ -9,6 +9,8 @@ use MongoDB\Client;
 use MongoDB\Driver\ReadConcern;
 use MongoDB\Driver\ReadPreference;
 use MongoDB\Driver\WriteConcern;
+use Closure;
+use Throwable;
 
 class Connection extends BaseConnection
 {
@@ -284,6 +286,40 @@ class Connection extends BaseConnection
         return call_user_func_array([$this->db, $method], $parameters);
     }
 
+    public function transaction(Closure $callback, $attempts = 1) {
+        for ($currentAttempt = 1; $currentAttempt <= $attempts; $currentAttempt++) {
+            $this->beginTransaction();
+
+            // We'll simply execute the given callback within a try / catch block and if we
+            // catch any exception we can rollback this transaction so that none of this
+            // gets actually persisted to a database or stored in a permanent fashion.
+            try {
+                $callbackResult = $callback($this);
+            }
+                // If we catch an exception we'll rollback this transaction and try again if we
+                // are not out of attempts. If we are out of attempts we will just throw the
+                // exception back out and let the developer handle an uncaught exceptions.
+            catch (Throwable $e) {
+                if($this->transactions > 1) {
+                    $this->transactions--;
+                    throw $e;
+                }
+                $this->rollBack();
+                throw $e;
+            }
+
+            try {
+                if ($this->transactions == 1) {
+                   $this->commit();
+                }
+            } catch (Throwable $e) {
+                $this->transactions = max(0, $this->transactions - 1);
+                continue;
+            }
+            $this->fireConnectionEvent('committed');
+            return $callbackResult;
+        }
+    }
     /**
      * create a session and start a transaction in session
      *
@@ -304,6 +340,7 @@ class Connection extends BaseConnection
             'writeConcern' => new WriteConcern(1),
             'readConcern' => new ReadConcern(ReadConcern::LOCAL)
         ]);
+        $this->transactions++;
     }
 
     /**
@@ -312,10 +349,12 @@ class Connection extends BaseConnection
      */
     public function commit()
     {
-        if ($session = $this->getSession()) {
+        $session = $this->getSession();
+        if ($session && $this->transactions == 1) {
             $session->commitTransaction();
             $this->setLastSession();
         }
+        $this->transactions = max(0, $this->transactions - 1);
     }
 
     /**
@@ -324,10 +363,19 @@ class Connection extends BaseConnection
      */
     public function rollBack($toLevel = null)
     {
+        $toLevel = is_null($toLevel)
+            ? $this->transactions - 1
+            : $toLevel;
+
+        if ($toLevel < 0 || $toLevel >= $this->transactions) {
+            return;
+        }
         if ($session = $this->getSession()) {
             $session->abortTransaction();
             $this->setLastSession();
         }
+
+        $this->transactions = $toLevel;
     }
 
     /**
