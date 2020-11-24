@@ -286,6 +286,12 @@ class Connection extends BaseConnection
         return call_user_func_array([$this->db, $method], $parameters);
     }
 
+    /**
+     * @param Closure $callback
+     * @param int $attempts
+     * @return mixed
+     * @throws Throwable
+     */
     public function transaction(Closure $callback, $attempts = 1) {
         for ($currentAttempt = 1; $currentAttempt <= $attempts; $currentAttempt++) {
             $this->beginTransaction();
