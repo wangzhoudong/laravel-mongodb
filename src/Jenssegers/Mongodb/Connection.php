@@ -6,6 +6,11 @@ use Illuminate\Database\Connection as BaseConnection;
 use Illuminate\Support\Arr;
 use InvalidArgumentException;
 use MongoDB\Client;
+use MongoDB\Driver\ReadConcern;
+use MongoDB\Driver\ReadPreference;
+use MongoDB\Driver\WriteConcern;
+use Closure;
+use Throwable;
 
 class Connection extends BaseConnection
 {
@@ -20,6 +25,9 @@ class Connection extends BaseConnection
      * @var \MongoDB\Client
      */
     protected $connection;
+
+    protected $session_key;
+    protected $sessions = [];
 
     /**
      * Create a new database connection instance.
@@ -276,5 +284,131 @@ class Connection extends BaseConnection
     public function __call($method, $parameters)
     {
         return call_user_func_array([$this->db, $method], $parameters);
+    }
+
+    /**
+     * @param Closure $callback
+     * @param int $attempts
+     * @return mixed
+     * @throws Throwable
+     */
+    public function transaction(Closure $callback, $attempts = 1) {
+        for ($currentAttempt = 1; $currentAttempt <= $attempts; $currentAttempt++) {
+            $this->beginTransaction();
+
+            // We'll simply execute the given callback within a try / catch block and if we
+            // catch any exception we can rollback this transaction so that none of this
+            // gets actually persisted to a database or stored in a permanent fashion.
+            try {
+                $callbackResult = $callback($this);
+            }
+                // If we catch an exception we'll rollback this transaction and try again if we
+                // are not out of attempts. If we are out of attempts we will just throw the
+                // exception back out and let the developer handle an uncaught exceptions.
+            catch (Throwable $e) {
+                if($this->transactions > 1) {
+                    $this->transactions--;
+                    throw $e;
+                }
+                $this->rollBack();
+                throw $e;
+            }
+
+            try {
+                if ($this->transactions == 1) {
+                   $this->commit();
+                }
+            } catch (Throwable $e) {
+                $this->transactions = max(0, $this->transactions - 1);
+                continue;
+            }
+            $this->fireConnectionEvent('committed');
+            return $callbackResult;
+        }
+    }
+    /**
+     * create a session and start a transaction in session
+     *
+     * In version 4.0, MongoDB supports multi-document transactions on replica sets.
+     * In version 4.2, MongoDB introduces distributed transactions, which adds support for multi-document transactions on sharded clusters and incorporates the existing support for multi-document transactions on replica sets.
+     * To use transactions on MongoDB 4.2 deployments(replica sets and sharded clusters), clients must use MongoDB drivers updated for MongoDB 4.2.
+     *
+     * @see https://docs.mongodb.com/manual/core/transactions/
+     * @return void
+     */
+    public function beginTransaction()
+    {
+        $this->session_key = uniqid();
+        $this->sessions[$this->session_key] = $this->connection->startSession();
+
+        $this->sessions[$this->session_key]->startTransaction([
+            'readPreference' => new ReadPreference(ReadPreference::RP_PRIMARY),
+            'writeConcern' => new WriteConcern(1),
+            'readConcern' => new ReadConcern(ReadConcern::LOCAL)
+        ]);
+        $this->transactions++;
+    }
+
+    /**
+     * commit transaction in this session and close this session
+     * @return void
+     */
+    public function commit()
+    {
+        $session = $this->getSession();
+        if ($session && $this->transactions == 1) {
+            $session->commitTransaction();
+            $this->setLastSession();
+        }
+        $this->transactions = max(0, $this->transactions - 1);
+    }
+
+    /**
+     * rollback transaction in this session and close this session
+     * @return void
+     */
+    public function rollBack($toLevel = null)
+    {
+        $toLevel = is_null($toLevel)
+            ? $this->transactions - 1
+            : $toLevel;
+
+        if ($toLevel < 0 || $toLevel >= $this->transactions) {
+            return;
+        }
+        if ($session = $this->getSession()) {
+            $session->abortTransaction();
+            $this->setLastSession();
+        }
+
+        $this->transactions = $toLevel;
+    }
+
+    /**
+     * close this session and get last session key to session_key
+     * Why do it ? Because nested transactions
+     * @return void
+     */
+    protected function setLastSession()
+    {
+        if ($session = $this->getSession()) {
+            $session->endSession();
+            unset($this->sessions[$this->session_key]);
+            if (empty($this->sessions)) {
+                $this->session_key = null;
+            } else {
+                end($this->sessions);
+                $this->session_key = key($this->sessions);
+            }
+        }
+    }
+
+    /**
+     * get now session if it has session
+     * @return \MongoDB\Driver\Session|null
+     */
+    public function getSession()
+    {
+        return $this->sessions[$this->session_key] ?? null;
     }
 }
