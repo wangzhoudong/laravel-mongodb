@@ -338,6 +338,9 @@ class Connection extends BaseConnection
      */
     public function beginTransaction()
     {
+        if(!(isset($this->config['options']['isOpenSession']) && $this->config['options']['isOpenSession'])) {
+            return;
+        }
         $this->session_key = uniqid();
         $this->sessions[$this->session_key] = $this->connection->startSession();
 
